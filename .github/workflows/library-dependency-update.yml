@@ -1,0 +1,131 @@
+name: TAF Library Dependency Update
+
+on:
+  repository_dispatch:
+    types: [taf-library-published]
+  workflow_dispatch:
+    inputs:
+      library_ref:
+        description: TAF.Library branch, tag or commit to read project.json from (empty = default branch)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: taf-library-update-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PACKAGE_ID: TAF.Library
+  LIBRARY_REPO: rudy-co/RPA.TAF.Library   # change to the real library repository
+  LIBRARY_DIR: taf-library
+  CONSUMER_DIR: consumer
+
+jobs:
+  prepare-update:
+    name: Prepare Dependency Update
+    # env context is not available in job-level `if`, so the package id is literal here
+    if: github.event_name == 'workflow_dispatch' || github.event.client_payload.package == 'TAF.Library'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.library.outputs.version }}
+      current-version: ${{ steps.check.outputs.current-version }}
+      update-required: ${{ steps.check.outputs.update-required }}
+
+    steps:
+      - name: Checkout TAF.Library project.json
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.LIBRARY_REPO }}
+          ref: ${{ github.event.client_payload.ref || inputs.library_ref }}
+          token: ${{ secrets.TAF_LIBRARY_TOKEN || github.token }}
+          path: ${{ env.LIBRARY_DIR }}
+          sparse-checkout: /project.json
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Read library version from project.json
+        id: library
+        shell: pwsh
+        run: |
+          $file = Join-Path $env:LIBRARY_DIR 'project.json'
+
+          if (-not (Test-Path $file)) {
+            throw "project.json was not found in $env:LIBRARY_REPO."
+          }
+
+          try {
+            $library = Get-Content $file -Raw | ConvertFrom-Json
+          } catch {
+            throw "Library project.json is not valid JSON: $($_.Exception.Message)"
+          }
+
+          if ($library.name -ne $env:PACKAGE_ID) {
+            throw "Expected library '$env:PACKAGE_ID' but project.json name is '$($library.name)'."
+          }
+
+          $version = "$($library.projectVersion)".Trim()
+
+          if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Invalid or missing production projectVersion: '$version'"
+          }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "$env:PACKAGE_ID projectVersion: $version"
+
+      - name: Checkout consumer project.json
+        uses: actions/checkout@v4
+        with:
+          path: ${{ env.CONSUMER_DIR }}
+          sparse-checkout: /project.json
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Validate consumer project
+        id: check
+        shell: pwsh
+        env:
+          REQUESTED_VERSION: ${{ steps.library.outputs.version }}
+        run: |
+          $file = Join-Path $env:CONSUMER_DIR 'project.json'
+
+          if (-not (Test-Path $file)) {
+            throw "Consumer project.json was not found."
+          }
+
+          try {
+            $project = Get-Content $file -Raw | ConvertFrom-Json
+          } catch {
+            throw "Consumer project.json is not valid JSON: $($_.Exception.Message)"
+          }
+
+          $dependency = $project.dependencies.PSObject.Properties[$env:PACKAGE_ID]
+          if (-not $dependency) {
+            throw "$env:PACKAGE_ID is not declared in consumer project.json."
+          }
+
+          # UiPath stores versions as "[1.2.3]" (or a range like "[1.2.3, )")
+          $current   = ($dependency.Value -replace '[\[\]\(\)\s]', '').Split(',')[0]
+          $requested = [version]$env:REQUESTED_VERSION
+          $parsed    = $null
+
+          if (-not [version]::TryParse($current, [ref]$parsed)) {
+            Write-Warning "Cannot parse current version '$current'; forcing update."
+            $updateRequired = $true
+          } else {
+            $updateRequired = $requested -gt $parsed
+          }
+
+          "current-version=$current" >> $env:GITHUB_OUTPUT
+          "update-required=$($updateRequired.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+
+          if ($updateRequired) {
+            Write-Host "Update required: $current -> $requested"
+          } else {
+            Write-Host "::notice::$env:PACKAGE_ID is already at $current (library is $requested). Skipping."
+          }
+
+          "### $env:PACKAGE_ID`n| Current | Library project.json | Update |`n|---|---|---|`n| $current | $requested | $updateRequired |" >> $env:GITHUB_STEP_SUMMARY
