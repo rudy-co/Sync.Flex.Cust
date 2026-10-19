@@ -1,0 +1,6 @@
+{
+  "Name": "TAF RPA IT Sync Flex Cust to Confins",
+  "ProjectType": "Process",
+  "Description": "Click report di datamining untuk sync data Flex customer ke Confins.",
+  "MainFile": "Main.xaml"
+}
