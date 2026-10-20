@@ -2,11 +2,13 @@ name: TAF Library Dependency Update
 
 on:
   repository_dispatch:
-    types: [taf-library-published]
+    types:
+      - taf-library-published
+
   workflow_dispatch:
     inputs:
       library_ref:
-        description: TAF.Library branch, tag or commit to read project.json from (empty = default branch)
+        description: "Library branch, tag, or commit to read project.json from (e.g. v1.2.3)"
         required: false
         type: string
 
@@ -14,118 +16,438 @@ permissions:
   contents: read
 
 concurrency:
-  group: taf-library-update-${{ github.ref }}
+  group: taf-library-update-production
   cancel-in-progress: false
 
 env:
   PACKAGE_ID: TAF.Library
-  LIBRARY_REPO: rudy-co/RPA.TAF.Library   # change to the real library repository
+  LIBRARY_REPO: rudy-co/RPA.TAF.Library
   LIBRARY_DIR: taf-library
   CONSUMER_DIR: consumer
+  TARGET_BRANCH: Production
 
 jobs:
-  prepare-update:
-    name: Prepare Dependency Update
-    # env context is not available in job-level `if`, so the package id is literal here
-    if: github.event_name == 'workflow_dispatch' || github.event.client_payload.package == 'TAF.Library'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      version: ${{ steps.library.outputs.version }}
-      current-version: ${{ steps.check.outputs.current-version }}
-      update-required: ${{ steps.check.outputs.update-required }}
+  update-and-validate:
+    name: Update and Validate TAF.Library Dependency
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.client_payload.package == 'TAF.Library'
+
+    runs-on: windows-latest
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout TAF.Library project.json
+      # =========================================================
+      # STEP 1: Checkout library release
+      # =========================================================
+      - name: Checkout TAF.Library release
         uses: actions/checkout@v4
         with:
           repository: ${{ env.LIBRARY_REPO }}
-          ref: ${{ github.event.client_payload.ref || inputs.library_ref }}
+          ref: ${{ github.event.client_payload.ref || inputs.library_ref || '' }}
           token: ${{ secrets.TAF_LIBRARY_TOKEN || github.token }}
           path: ${{ env.LIBRARY_DIR }}
-          sparse-checkout: /project.json
+          sparse-checkout: project.json
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
-      - name: Read library version from project.json
+      # =========================================================
+      # STEP 2: Read and validate library version
+      # =========================================================
+      - name: Validate library release metadata
         id: library
         shell: pwsh
+        env:
+          EVENT_VERSION: ${{ github.event.client_payload.version }}
         run: |
+          $ErrorActionPreference = 'Stop'
+
           $file = Join-Path $env:LIBRARY_DIR 'project.json'
 
           if (-not (Test-Path $file)) {
-            throw "project.json was not found in $env:LIBRARY_REPO."
+            throw "Library project.json was not found: $file"
           }
 
           try {
             $library = Get-Content $file -Raw | ConvertFrom-Json
-          } catch {
-            throw "Library project.json is not valid JSON: $($_.Exception.Message)"
+          }
+          catch {
+            throw "Library project.json is invalid JSON: $($_.Exception.Message)"
           }
 
           if ($library.name -ne $env:PACKAGE_ID) {
-            throw "Expected library '$env:PACKAGE_ID' but project.json name is '$($library.name)'."
+            throw "Expected library '$env:PACKAGE_ID', but found '$($library.name)'."
           }
 
           $version = "$($library.projectVersion)".Trim()
 
-          if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
-            throw "Invalid or missing production projectVersion: '$version'"
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Invalid library projectVersion '$version'. Expected MAJOR.MINOR.PATCH."
+          }
+
+          if (
+            $env:GITHUB_EVENT_NAME -eq 'repository_dispatch' -and
+            -not [string]::IsNullOrWhiteSpace($env:EVENT_VERSION)
+          ) {
+            if ($version -ne $env:EVENT_VERSION) {
+              throw "Release mismatch. Dispatch version='$env:EVENT_VERSION'; project.json version='$version'."
+            }
           }
 
           "version=$version" >> $env:GITHUB_OUTPUT
-          Write-Host "$env:PACKAGE_ID projectVersion: $version"
 
-      - name: Checkout consumer project.json
+          Write-Host "Library package : $env:PACKAGE_ID"
+          Write-Host "Library version : $version"
+
+      # =========================================================
+      # STEP 3: Checkout full consumer repository
+      # =========================================================
+      - name: Checkout consumer Production branch
         uses: actions/checkout@v4
         with:
+          ref: ${{ env.TARGET_BRANCH }}
           path: ${{ env.CONSUMER_DIR }}
-          sparse-checkout: /project.json
-          sparse-checkout-cone-mode: false
+          token: ${{ secrets.TAF_LIBRARY_TOKEN || github.token }}
           persist-credentials: false
 
-      - name: Validate consumer project
+      # =========================================================
+      # STEP 4: Validate consumer dependency and compare versions
+      # =========================================================
+      - name: Validate consumer dependency
         id: check
         shell: pwsh
         env:
           REQUESTED_VERSION: ${{ steps.library.outputs.version }}
         run: |
+          $ErrorActionPreference = 'Stop'
+
           $file = Join-Path $env:CONSUMER_DIR 'project.json'
 
           if (-not (Test-Path $file)) {
-            throw "Consumer project.json was not found."
+            throw "Consumer project.json was not found: $file"
           }
 
           try {
             $project = Get-Content $file -Raw | ConvertFrom-Json
-          } catch {
-            throw "Consumer project.json is not valid JSON: $($_.Exception.Message)"
+          }
+          catch {
+            throw "Consumer project.json is invalid JSON: $($_.Exception.Message)"
+          }
+
+          if (-not $project.dependencies) {
+            throw "Consumer project.json does not contain a dependencies object."
           }
 
           $dependency = $project.dependencies.PSObject.Properties[$env:PACKAGE_ID]
+
           if (-not $dependency) {
-            throw "$env:PACKAGE_ID is not declared in consumer project.json."
+            throw "Dependency '$env:PACKAGE_ID' is not declared in consumer project.json."
           }
 
-          # UiPath stores versions as "[1.2.3]" (or a range like "[1.2.3, )")
-          $current   = ($dependency.Value -replace '[\[\]\(\)\s]', '').Split(',')[0]
-          $requested = [version]$env:REQUESTED_VERSION
-          $parsed    = $null
+          $currentRaw = "$($dependency.Value)".Trim()
 
-          if (-not [version]::TryParse($current, [ref]$parsed)) {
-            Write-Warning "Cannot parse current version '$current'; forcing update."
+          # This workflow expects an exact dependency version:
+          # [1.2.3]
+          # Version ranges require separate handling.
+          if ($currentRaw -notmatch '^\[\s*\d+\.\d+\.\d+\s*\]$') {
+            throw "Unsupported dependency version '$currentRaw'. Expected an exact version such as '[1.2.3]'."
+          }
+
+          $current = $currentRaw.Trim('[', ']', ' ')
+          $requested = $env:REQUESTED_VERSION
+
+          $currentVersion = [version]$current
+          $requestedVersion = [version]$requested
+
+          $updateRequired = $false
+          $reason = ''
+
+          if ($requestedVersion -gt $currentVersion) {
             $updateRequired = $true
-          } else {
-            $updateRequired = $requested -gt $parsed
+            $reason = 'A newer library version is available.'
+          }
+          elseif ($requestedVersion -eq $currentVersion) {
+            $reason = 'Consumer already uses the requested version.'
+          }
+          else {
+            $reason = 'Consumer dependency is newer than requested. Downgrade is blocked.'
           }
 
           "current-version=$current" >> $env:GITHUB_OUTPUT
+          "requested-version=$requested" >> $env:GITHUB_OUTPUT
           "update-required=$($updateRequired.ToString().ToLower())" >> $env:GITHUB_OUTPUT
 
-          if ($updateRequired) {
-            Write-Host "Update required: $current -> $requested"
-          } else {
-            Write-Host "::notice::$env:PACKAGE_ID is already at $current (library is $requested). Skipping."
+          Write-Host "Current version   : $current"
+          Write-Host "Requested version : $requested"
+          Write-Host "Update required   : $updateRequired"
+          Write-Host "Decision          : $reason"
+
+          @"
+          ## TAF.Library Dependency Check
+
+          | Item | Value |
+          |---|---|
+          | Consumer repository | $env:GITHUB_REPOSITORY |
+          | Target branch | $env:TARGET_BRANCH |
+          | Current version | $current |
+          | Requested version | $requested |
+          | Update required | $updateRequired |
+          | Decision | $reason |
+          "@ >> $env:GITHUB_STEP_SUMMARY
+
+      # =========================================================
+      # STEP 5: Update dependency in project.json
+      # =========================================================
+      - name: Update library dependency
+        if: steps.check.outputs.update-required == 'true'
+        shell: pwsh
+        env:
+          REQUESTED_VERSION: ${{ steps.check.outputs.requested-version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $file = Join-Path $env:CONSUMER_DIR 'project.json'
+
+          $project = Get-Content $file -Raw | ConvertFrom-Json
+
+          $dependency = $project.dependencies.PSObject.Properties[$env:PACKAGE_ID]
+
+          if (-not $dependency) {
+            throw "Dependency '$env:PACKAGE_ID' was not found before update."
           }
 
-          "### $env:PACKAGE_ID`n| Current | Library project.json | Update |`n|---|---|---|`n| $current | $requested | $updateRequired |" >> $env:GITHUB_STEP_SUMMARY
+          # Set the exact dependency version.
+          $project.dependencies.($env:PACKAGE_ID) = "[$env:REQUESTED_VERSION]"
+
+          $json = $project | ConvertTo-Json -Depth 100
+
+          # Validate JSON before saving.
+          try {
+            $null = $json | ConvertFrom-Json
+          }
+          catch {
+            throw "Generated project.json is invalid: $($_.Exception.Message)"
+          }
+
+          # Write UTF-8 without BOM.
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+          [System.IO.File]::WriteAllText(
+            $file,
+            $json + [Environment]::NewLine,
+            $utf8NoBom
+          )
+
+          # Verify the saved dependency.
+          $saved = Get-Content $file -Raw | ConvertFrom-Json
+          $savedDependency = $saved.dependencies.PSObject.Properties[$env:PACKAGE_ID]
+
+          if ($savedDependency.Value -ne "[$env:REQUESTED_VERSION]") {
+            throw "Dependency update verification failed."
+          }
+
+          Write-Host "Updated $env:PACKAGE_ID to [$env:REQUESTED_VERSION]."
+
+      # =========================================================
+      # STEP 6: Validate updated project metadata
+      # =========================================================
+      - name: Validate updated project files
+        if: steps.check.outputs.update-required == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $projectDir = Join-Path $env:GITHUB_WORKSPACE $env:CONSUMER_DIR
+          $projectFile = Join-Path $projectDir 'project.json'
+
+          if (-not (Test-Path $projectFile)) {
+            throw "Consumer project.json is missing."
+          }
+
+          try {
+            $project = Get-Content $projectFile -Raw | ConvertFrom-Json
+          }
+          catch {
+            throw "Consumer project.json is invalid JSON: $($_.Exception.Message)"
+          }
+
+          if ([string]::IsNullOrWhiteSpace("$($project.name)")) {
+            throw "Consumer project name is missing."
+          }
+
+          if ([string]::IsNullOrWhiteSpace("$($project.projectVersion)")) {
+            throw "Consumer projectVersion is missing."
+          }
+
+          if (-not $project.dependencies) {
+            throw "Consumer dependencies object is missing."
+          }
+
+          $dependency = $project.dependencies.PSObject.Properties[$env:PACKAGE_ID]
+
+          if (-not $dependency) {
+            throw "Dependency '$env:PACKAGE_ID' is missing."
+          }
+
+          Write-Host "Consumer project name    : $($project.name)"
+          Write-Host "Consumer project version : $($project.projectVersion)"
+          Write-Host "$env:PACKAGE_ID dependency : $($dependency.Value)"
+          Write-Host "Project metadata validation passed."
+
+      # =========================================================
+      # STEP 7: Setup Node.js
+      # =========================================================
+      - name: Setup Node.js
+        if: steps.check.outputs.update-required == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # =========================================================
+      # STEP 8: Install UiPath CLI and RPA tool
+      # =========================================================
+      - name: Install UiPath CLI
+        if: steps.check.outputs.update-required == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          npm install --global @uipath/cli@1.202.1
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to install UiPath CLI."
+          }
+
+          uip --version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "UiPath CLI is not available."
+          }
+
+          uip tools install rpa
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to install the UiPath RPA tool."
+          }
+
+      # =========================================================
+      # STEP 9: Restore dependencies
+      # =========================================================
+      - name: Restore UiPath project dependencies
+        if: steps.check.outputs.update-required == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $projectDir = Join-Path $env:GITHUB_WORKSPACE $env:CONSUMER_DIR
+
+          Push-Location $projectDir
+          try {
+            uip rpa restore .
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "UiPath dependency restore failed."
+            }
+          }
+          finally {
+            Pop-Location
+          }
+
+      # =========================================================
+      # STEP 10: Pack consumer project
+      # =========================================================
+      - name: Pack UiPath consumer project
+        if: steps.check.outputs.update-required == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $projectDir = Join-Path $env:GITHUB_WORKSPACE $env:CONSUMER_DIR
+          $outputDir = Join-Path $env:RUNNER_TEMP 'uipath-package'
+
+          New-Item -ItemType Directory -Path $outputDir -Force |
+            Out-Null
+
+          Push-Location $projectDir
+          try {
+            uip rpa pack . $outputDir --output-type Process
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "UiPath package creation failed."
+            }
+          }
+          finally {
+            Pop-Location
+          }
+
+          $packages = Get-ChildItem $outputDir -Filter '*.nupkg'
+
+          if (-not $packages) {
+            throw "Pack command completed but no .nupkg was produced."
+          }
+
+          Write-Host "Generated packages:"
+          $packages | ForEach-Object {
+            Write-Host " - $($_.FullName)"
+          }
+
+      # =========================================================
+      # STEP 11: Create Pull Request to Production
+      # =========================================================
+      - name: Create dependency update pull request
+        if: steps.check.outputs.update-required == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.TAF_LIBRARY_TOKEN || github.token }}
+          path: ${{ env.CONSUMER_DIR }}
+          branch: automation/update-taf-library-${{ steps.library.outputs.version }}
+          base: ${{ env.TARGET_BRANCH }}
+          delete-branch: true
+          add-paths: |
+            project.json
+          commit-message: "chore(deps): update TAF.Library to ${{ steps.library.outputs.version }}"
+          title: "chore(deps): update TAF.Library to ${{ steps.library.outputs.version }}"
+          body: |
+            ## Summary
+
+            Automated dependency update for `TAF.Library`.
+
+            | Item | Value |
+            |---|---|
+            | Package | `TAF.Library` |
+            | Previous version | `${{ steps.check.outputs.current-version }}` |
+            | New version | `${{ steps.library.outputs.version }}` |
+            | Target branch | `${{ env.TARGET_BRANCH }}` |
+
+            ## Validation
+
+            - [x] Library release metadata validated
+            - [x] Consumer dependency updated
+            - [x] Consumer project metadata validated
+            - [x] Dependency restore completed
+            - [x] Consumer package creation completed
+
+            Please review the dependency change before merging.
+
+      # =========================================================
+      # STEP 12: Report when no update is required
+      # =========================================================
+      - name: Report skipped update
+        if: steps.check.outputs.update-required != 'true'
+        shell: pwsh
+        env:
+          CURRENT_VERSION: ${{ steps.check.outputs.current-version }}
+          REQUESTED_VERSION: ${{ steps.check.outputs.requested-version }}
+        run: |
+          @"
+          ## Dependency Update Skipped
+
+          `TAF.Library` does not require an update.
+
+          - Current consumer version: $env:CURRENT_VERSION
+          - Requested library version: $env:REQUESTED_VERSION
+
+          No pull request was created.
+          "@ >> $env:GITHUB_STEP_SUMMARY
+
+          Write-Host "No dependency update was performed."
