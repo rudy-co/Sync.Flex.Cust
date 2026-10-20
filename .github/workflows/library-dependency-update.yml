@@ -37,8 +37,8 @@ jobs:
       # =========================================================
       - name: Verify library repository access
         shell: pwsh
-        env:
-          LIBRARY_TOKEN: ${{ secrets.TAF_LIBRARY_TOKEN }}
+        environment: uipath-prod
+
         run: |
           $ErrorActionPreference = 'Stop'
 
