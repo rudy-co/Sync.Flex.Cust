@@ -6,11 +6,6 @@ on:
       - taf-library-published
 
   workflow_dispatch:
-    inputs:
-      library_ref:
-        description: "Library branch, tag, or commit to read project.json from (e.g. v1.2.3)"
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -44,7 +39,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ env.LIBRARY_REPO }}
-          ref: ${{ github.event.client_payload.ref || inputs.library_ref || '' }}
+          ref: ${{ github.event.client_payload.ref || '' }}
           token: ${{ secrets.TAF_LIBRARY_TOKEN || github.token }}
           path: ${{ env.LIBRARY_DIR }}
           sparse-checkout: project.json
