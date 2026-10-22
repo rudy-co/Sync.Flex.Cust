@@ -4,7 +4,7 @@
   "description": "Click report di datamining untuk sync data Flex customer ke Confins.",
   "main": "Main.xaml",
   "dependencies": {
-    "TAF.Library": "[1.1.19]"
+    "TAF.Library": "[1.1.22]"
   },
   "webServices": [],
   "entitiesStores": [],
