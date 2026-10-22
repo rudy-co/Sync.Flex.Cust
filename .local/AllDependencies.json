@@ -27462,9 +27462,9 @@
     "restore": {
       "projectUniqueName": "TAF RPA IT Sync Flex Cust to Confins",
       "projectName": "TAF RPA IT Sync Flex Cust to Confins",
-      "projectPath": "C:\\Users\\rudys\\Downloads\\TAF.RPA.IT.Sync.Flex.Cust.to.Confins.1.0.10\\.local",
+      "projectPath": "C:\\Users\\rudys\\Downloads\\MyLibrary\\Sync.Flex.Cust\\.local",
       "packagesPath": "C:\\Users\\rudys\\.nuget\\packages\\",
-      "outputPath": "C:\\Users\\rudys\\Downloads\\TAF.RPA.IT.Sync.Flex.Cust.to.Confins.1.0.10\\.local",
+      "outputPath": "C:\\Users\\rudys\\Downloads\\MyLibrary\\Sync.Flex.Cust\\.local",
       "UsingMicrosoftNETSdk": false,
       "fallbackFolders": [
         "C:\\Program Files (x86)\\Microsoft Visual Studio\\Shared\\NuGetPackages"

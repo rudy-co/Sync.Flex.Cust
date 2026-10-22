@@ -350,7 +350,7 @@ jobs:
           node-version: '22'
 
       # =========================================================
-      # STEP 9: Install UiPath CLI and RPA tool
+      # STEP 9a: Install UiPath CLI and RPA tool
       # =========================================================
       - name: Install UiPath CLI
         if: steps.check.outputs.update-required == 'true'
@@ -375,6 +375,40 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Failed to install the UiPath RPA tool."
           }
+
+      # =========================================================
+      # STEP 9b: Log in to UiPath so restore can use the
+      # tenant Orchestrator library feed (where TAF.Library lives)
+      # =========================================================
+      - name: Log in to UiPath Orchestrator
+        if: steps.check.outputs.update-required == 'true'
+        shell: pwsh
+        env:
+          UIPATH_CLIENT_ID: ${{ secrets.UIPATH_CLIENT_ID }}
+          UIPATH_CLIENT_SECRET: ${{ secrets.UIPATH_CLIENT_SECRET }}
+          UIPATH_TENANT: ${{ vars.UIPATH_TENANT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ([string]::IsNullOrWhiteSpace($env:UIPATH_CLIENT_ID) -or
+              [string]::IsNullOrWhiteSpace($env:UIPATH_CLIENT_SECRET)) {
+            throw "UIPATH_CLIENT_ID / UIPATH_CLIENT_SECRET secrets are not set."
+          }
+
+          # env.NAME makes uip read the value from the environment,
+          # so the secret never appears on the command line.
+          uip login `
+            --client-id env.UIPATH_CLIENT_ID `
+            --client-secret env.UIPATH_CLIENT_SECRET `
+            --tenant "$env:UIPATH_TENANT" `
+            --scope "OR.Execution.Read" `
+            --output json
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "UiPath login failed. Check the external app credentials, scopes and tenant name."
+          }
+
+          uip login status --output json
 
       # =========================================================
       # STEP 10: Restore dependencies
