@@ -16,9 +16,9 @@ concurrency:
 
 env:
   NODE_VERSION: "22"
-  UIPATH_CLI_VERSION: "1.0.0"
+  UIPATH_CLI_VERSION: "1.202.1"
   PROJECT_FILE: "project.json"
-  OUTPUT_DIR: "./dist"
+  OUTPUT_DIR: "dist"
 
 jobs:
   publish:
@@ -146,87 +146,106 @@ jobs:
         env:
           UIPATH_CLIENT_ID: ${{ secrets.UIPATH_CLIENT_ID }}
           UIPATH_CLIENT_SECRET: ${{ secrets.UIPATH_CLIENT_SECRET }}
+          UIPATH_ORG: ${{ vars.UIPATH_ORG }}
           UIPATH_TENANT: ${{ vars.UIPATH_TENANT }}
+          UIPATH_URL: ${{ vars.UIPATH_URL || 'https://cloud.uipath.com' }}
+          UIPATH_SCOPE: ${{ vars.UIPATH_SCOPE || 'OR.Execution OR.Folders.Read' }}
         run: |
           set -euo pipefail
 
-          if [ -z "$UIPATH_TENANT" ]; then
-            echo "::error::The GitHub Environment variable UIPATH_TENANT has not been configured."
-            exit 1
-          fi
+          for v in UIPATH_CLIENT_ID UIPATH_CLIENT_SECRET UIPATH_ORG UIPATH_TENANT; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::$v is empty in environment 'uipath-prod'"
+              exit 1
+            fi
+          done
 
-          if [ -z "$UIPATH_CLIENT_ID" ] || [ -z "$UIPATH_CLIENT_SECRET" ]; then
-            echo "::error::UiPath client credentials have not been configured."
-            exit 1
-          fi
+          uip login --authority "$UIPATH_URL" \
+            --organization "$UIPATH_ORG" \
+            --tenant "$UIPATH_TENANT" \
+            --client-id "$UIPATH_CLIENT_ID" \
+            --client-secret "$UIPATH_CLIENT_SECRET" \
+            --scope "$UIPATH_SCOPE" \
+            --output json
 
-          uip login \
-            --client-id env.UIPATH_CLIENT_ID \
-            --client-secret env.UIPATH_CLIENT_SECRET \
-            --tenant "$UIPATH_TENANT"
-
-          uip login status
+          uip login status --output json
 
       # --------------------------------------------------
-      # STEP 7: Build and pack the UiPath project
+      # STEP 7: Restore, build and pack the UiPath project
       # --------------------------------------------------
       - name: Pack UiPath project
+        id: pack
         shell: bash
         env:
           PROJECT_VERSION: ${{ steps.project.outputs.version }}
         run: |
           set -euo pipefail
 
-          mkdir -p "$OUTPUT_DIR"
+          # Pack output must be OUTSIDE the project folder.
+          OUT="$RUNNER_TEMP/$OUTPUT_DIR"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
 
-          # Use positional arguments for the project path
-          # and output directory.
-          uip rpa pack "." "$OUTPUT_DIR"
+          # Restore dependencies (including TAF.Library) from the Orchestrator feeds.
+          uip rpa restore .
 
-          echo "Project version: $PROJECT_VERSION"
+          # Positional arguments: <project-dir> <output-dir>
+          uip rpa pack . "$OUT" \
+            --package-version "$PROJECT_VERSION" \
+            --skip-analyze \
+            --output json
 
-          mapfile -t PACKAGES < <(
-            find "$OUTPUT_DIR" \
-              -type f \
-              -name "*.nupkg"
-          )
-
-          if [ "${#PACKAGES[@]}" -eq 0 ]; then
-            echo "::error::No .nupkg package was generated."
-            exit 1
-          fi
-
-          printf 'Generated packages:\n'
-          printf ' - %s\n' "${PACKAGES[@]}"
+          mapfile -t PACKAGES < <(find "$OUT" -type f -name "*.nupkg")
 
           if [ "${#PACKAGES[@]}" -ne 1 ]; then
             echo "::error::Expected exactly one .nupkg package, but found ${#PACKAGES[@]}."
+            ls -la "$OUT"
             exit 1
           fi
 
+          NUPKG="${PACKAGES[0]}"
+
+          # Make sure the package carries the version from project.json.
+          if [[ "$(basename "$NUPKG")" != *".${PROJECT_VERSION}.nupkg" ]]; then
+            echo "::error::Package $(basename "$NUPKG") does not match version $PROJECT_VERSION."
+            exit 1
+          fi
+
+          echo "Generated package: $NUPKG"
+          echo "nupkg=$NUPKG" >> "$GITHUB_OUTPUT"
+
       # --------------------------------------------------
-      # STEP 8: Publish the package to UiPath Orchestrator
+      # STEP 8: Upload the package to UiPath Orchestrator
       # --------------------------------------------------
       - name: Publish package to Orchestrator
         shell: bash
+        env:
+          NUPKG: ${{ steps.pack.outputs.nupkg }}
         run: |
           set -euo pipefail
 
-          mapfile -t PACKAGES < <(
-            find "$OUTPUT_DIR" \
-              -type f \
-              -name "*.nupkg"
-          )
-
-          if [ "${#PACKAGES[@]}" -ne 1 ]; then
-            echo "::error::Expected exactly one .nupkg package, but found ${#PACKAGES[@]}."
+          if [ ! -f "$NUPKG" ]; then
+            echo "::error::Package not found: $NUPKG"
             exit 1
           fi
 
-          uip rpa publish "${PACKAGES[0]}" \
-            --shared-libraries
+          echo "Uploading $(basename "$NUPKG") to Orchestrator..."
 
-          echo "Package successfully submitted to UiPath Orchestrator."
+          RC=0
+          RESULT=$(uip or packages upload "$NUPKG" --output json 2>&1) || RC=$?
+          echo "$RESULT"
+
+          if [ "$RC" -ne 0 ]; then
+            # A re-run after a successful upload should not fail the pipeline.
+            if echo "$RESULT" | grep -qiE "already exist|conflict"; then
+              echo "::warning::$(basename "$NUPKG") already exists in Orchestrator, skipping upload."
+            else
+              echo "::error::Package upload failed (exit $RC)."
+              exit "$RC"
+            fi
+          fi
+
+          echo "Uploaded $(basename "$NUPKG") to Orchestrator" >> "$GITHUB_STEP_SUMMARY"
 
       # --------------------------------------------------
       # STEP 9: Generate the workflow summary
