@@ -6,6 +6,11 @@ on:
       - taf-library-published
 
   workflow_dispatch:
+    inputs:
+      project_version:
+        description: 'Optional consumer projectVersion (MAJOR.MINOR.PATCH). Leave blank to auto-increment PATCH.'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -31,6 +36,7 @@ jobs:
 
     runs-on: windows-latest
     timeout-minutes: 30
+    environment: uipath-prod
 
     steps:
       # =========================================================
@@ -184,6 +190,16 @@ jobs:
             throw "Consumer project.json does not contain a dependencies object."
           }
 
+          # Validate current consumer projectVersion.
+          $currentProjectVersion = "$($project.projectVersion)".Trim()
+
+          if ($currentProjectVersion -notmatch '^\d+\.\d+\.\d+$') {
+              throw "Invalid consumer projectVersion '$currentProjectVersion'. Expected MAJOR.MINOR.PATCH."
+          }
+
+          # Save current projectVersion for the update step.
+          "current-project-version=$currentProjectVersion" >> $env:GITHUB_OUTPUT
+          Write-Host "Current consumer projectVersion: $currentProjectVersion"
           $dependency = $project.dependencies.PSObject.Properties[$env:PACKAGE_ID]
 
           if (-not $dependency) {
@@ -242,32 +258,98 @@ jobs:
           "@ >> $env:GITHUB_STEP_SUMMARY
 
       # =========================================================
-      # STEP 6: Update dependency in project.json
+      # STEP 6: Update library dependency and projectVersion
       # =========================================================
-      - name: Update library dependency
+      - name: Update library dependency and projectVersion
+        id: update
         if: steps.check.outputs.update-required == 'true'
         shell: pwsh
         env:
           REQUESTED_VERSION: ${{ steps.check.outputs.requested-version }}
+          CURRENT_PROJECT_VERSION: ${{ steps.check.outputs.current-project-version }}
+          MANUAL_PROJECT_VERSION: ${{ inputs.project_version }}
         run: |
           $ErrorActionPreference = 'Stop'
 
           $file = Join-Path $env:CONSUMER_DIR 'project.json'
 
-          $project = Get-Content $file -Raw | ConvertFrom-Json
-
-          $dependency = $project.dependencies.PSObject.Properties[$env:PACKAGE_ID]
-
-          if (-not $dependency) {
-            throw "Dependency '$env:PACKAGE_ID' was not found before update."
+          if (-not (Test-Path $file)) {
+            throw "Consumer project.json was not found: $file"
           }
 
-          # Set the exact dependency version.
-          $project.dependencies.($env:PACKAGE_ID) = "[$env:REQUESTED_VERSION]"
+          $project = Get-Content $file -Raw | ConvertFrom-Json
 
+          # -------------------------------------------------------
+          # 1. Validate the current projectVersion
+          # -------------------------------------------------------
+          $currentVersionText = "$($project.projectVersion)".Trim()
+
+          if ($currentVersionText -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Invalid current projectVersion '$currentVersionText'. Expected MAJOR.MINOR.PATCH."
+          }
+
+          $currentVersion = [version]$currentVersionText
+
+          # -------------------------------------------------------
+          # 2. Determine the next projectVersion
+          # -------------------------------------------------------
+          $manualVersionText = "$env:MANUAL_PROJECT_VERSION".Trim()
+
+          if (-not [string]::IsNullOrWhiteSpace($manualVersionText)) {
+
+            # Use the manually supplied version.
+            if ($manualVersionText -notmatch '^\d+\.\d+\.\d+$') {
+              throw "Invalid manual projectVersion '$manualVersionText'. Expected MAJOR.MINOR.PATCH."
+            }
+
+            $newVersion = [version]$manualVersionText
+
+            if ($newVersion -le $currentVersion) {
+              throw "Manual projectVersion '$manualVersionText' must be greater than current version '$currentVersionText'."
+            }
+
+            $newVersionText = $manualVersionText
+
+            Write-Host "Versioning mode: MANUAL"
+          }
+          else {
+
+            # Automatically increment PATCH by one.
+            $newVersion = [version]::new(
+              $currentVersion.Major,
+              $currentVersion.Minor,
+              ($currentVersion.Build + 1)
+            )
+
+            $newVersionText = $newVersion.ToString(3)
+
+            Write-Host "Versioning mode: AUTOMATIC PATCH INCREMENT"
+          }
+
+          # -------------------------------------------------------
+          # 3. Update TAF.Library dependency
+          # -------------------------------------------------------
+          $packageId = $env:PACKAGE_ID
+
+          $dependency = $project.dependencies.PSObject.Properties[$packageId]
+
+          if (-not $dependency) {
+            throw "Dependency '$packageId' was not found before update."
+          }
+
+          $project.dependencies.($packageId) = "[$env:REQUESTED_VERSION]"
+
+          # -------------------------------------------------------
+          # 4. Update consumer projectVersion
+          # -------------------------------------------------------
+          $project.projectVersion = $newVersionText
+
+          # -------------------------------------------------------
+          # 5. Serialize JSON
+          # -------------------------------------------------------
           $json = $project | ConvertTo-Json -Depth 100
 
-          # Validate JSON before saving.
+          # Validate generated JSON before writing.
           try {
             $null = $json | ConvertFrom-Json
           }
@@ -284,15 +366,41 @@ jobs:
             $utf8NoBom
           )
 
-          # Verify the saved dependency.
+          # -------------------------------------------------------
+          # 6. Verify saved values
+          # -------------------------------------------------------
           $saved = Get-Content $file -Raw | ConvertFrom-Json
-          $savedDependency = $saved.dependencies.PSObject.Properties[$env:PACKAGE_ID]
+
+          $savedDependency = $saved.dependencies.PSObject.Properties[$packageId]
 
           if ($savedDependency.Value -ne "[$env:REQUESTED_VERSION]") {
             throw "Dependency update verification failed."
           }
 
-          Write-Host "Updated $env:PACKAGE_ID to [$env:REQUESTED_VERSION]."
+          if ("$($saved.projectVersion)" -ne $newVersionText) {
+            throw "projectVersion update verification failed."
+          }
+
+          # Expose the resulting version to later workflow steps.
+          "project-version=$newVersionText" >> $env:GITHUB_OUTPUT
+
+          Write-Host "Consumer project : $($saved.name)"
+          Write-Host "Old projectVersion: $currentVersionText"
+          Write-Host "New projectVersion: $newVersionText"
+          Write-Host "Updated dependency: $packageId [$env:REQUESTED_VERSION]"
+
+          @"
+          ## Consumer Project Version Update
+
+          | Item | Value |
+          |---|---|
+          | Project | $($saved.name) |
+          | Previous projectVersion | $currentVersionText |
+          | New projectVersion | $newVersionText |
+          | Library dependency | $packageId |
+          | Library version | $env:REQUESTED_VERSION |
+          | Versioning mode | $(if ([string]::IsNullOrWhiteSpace($manualVersionText)) { 'Automatic PATCH' } else { 'Manual' }) |
+          "@ >> $env:GITHUB_STEP_SUMMARY
 
       # =========================================================
       # STEP 7: Validate updated project metadata
@@ -487,8 +595,8 @@ jobs:
           delete-branch: true
           add-paths: |
             project.json
-          commit-message: "chore(deps): update TAF.Library to ${{ steps.library.outputs.version }}"
-          title: "chore(deps): update TAF.Library to ${{ steps.library.outputs.version }}"
+          commit-message: "chore(deps): update TAF.Library to ${{ steps.library.outputs.version }} and projectVersion to ${{ steps.update.outputs.project-version }}"
+          title: "chore(deps): update TAF.Library to ${{ steps.library.outputs.version }} and projectVersion to ${{ steps.update.outputs.project-version }}"
           body: |
             ## Summary
 
@@ -497,19 +605,22 @@ jobs:
             | Item | Value |
             |---|---|
             | Package | `TAF.Library` |
-            | Previous version | `${{ steps.check.outputs.current-version }}` |
-            | New version | `${{ steps.library.outputs.version }}` |
+            | Previous library version | `${{ steps.check.outputs.current-version }}` |
+            | New library version | `${{ steps.library.outputs.version }}` |
+            | Previous projectVersion | `${{ steps.check.outputs.current-project-version }}` |
+            | New projectVersion | `${{ steps.update.outputs.project-version }}` |
             | Target branch | `${{ env.TARGET_BRANCH }}` |
 
             ## Validation
 
             - [x] Library release metadata validated
             - [x] Consumer dependency updated
+            - [x] Consumer projectVersion updated
             - [x] Consumer project metadata validated
             - [x] Dependency restore completed
             - [x] Consumer package creation completed
 
-            Please review the dependency change before merging.
+            Please review the changes before merging.
 
       # =========================================================
       # STEP 13: Report when no update is required
